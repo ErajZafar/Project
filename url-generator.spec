@@ -1,10 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+
 block_cipher = None
 
 
 a = Analysis(['url-generator.py'],
-             pathex=['D:\\Proyectos\\The URL GOD\\the-url-god'],
+             pathex=['D:\\Proyectos\\The URL GOD\\the-url-god-2'],
              binaries=[],
              datas=[],
              hiddenimports=[],
