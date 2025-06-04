@@ -1,344 +1,749 @@
-"""distutils.command.config
+import ast
+import io
+import os
+import sys
 
-Implements the Distutils 'config' command, a (mostly) empty command class
-that exists mainly to be sub-classed by specific module distributions and
-applications.  The idea is that while every "config" command is different,
-at least they're all named the same, and users always see "config" in the
-list of standard commands.  Also, this is a good place to put common
-configure-like tasks: "try to compile this C code", or "figure out where
-this header file lives".
-"""
+import warnings
+import functools
+import importlib
+from collections import defaultdict
+from functools import partial
+from functools import wraps
+from glob import iglob
+import contextlib
 
-import os, re
-
-from distutils.core import Command
-from distutils.errors import DistutilsExecError
-from distutils.sysconfig import customize_compiler
-from distutils import log
-
-LANG_EXT = {"c": ".c", "c++": ".cxx"}
-
-class config(Command):
-
-    description = "prepare to build"
-
-    user_options = [
-        ('compiler=', None,
-         "specify the compiler type"),
-        ('cc=', None,
-         "specify the compiler executable"),
-        ('include-dirs=', 'I',
-         "list of directories to search for header files"),
-        ('define=', 'D',
-         "C preprocessor macros to define"),
-        ('undef=', 'U',
-         "C preprocessor macros to undefine"),
-        ('libraries=', 'l',
-         "external C libraries to link with"),
-        ('library-dirs=', 'L',
-         "directories to search for external C libraries"),
-
-        ('noisy', None,
-         "show every action (compile, link, run, ...) taken"),
-        ('dump-source', None,
-         "dump generated source files before attempting to compile them"),
-        ]
+from distutils.errors import DistutilsOptionError, DistutilsFileError
+from setuptools.extern.packaging.version import LegacyVersion, parse
+from setuptools.extern.packaging.specifiers import SpecifierSet
 
 
-    # The three standard command methods: since the "config" command
-    # does nothing by default, these are empty.
-
-    def initialize_options(self):
-        self.compiler = None
-        self.cc = None
-        self.include_dirs = None
-        self.libraries = None
-        self.library_dirs = None
-
-        # maximal output for now
-        self.noisy = 1
-        self.dump_source = 1
-
-        # list of temporary files generated along-the-way that we have
-        # to clean at some point
-        self.temp_files = []
-
-    def finalize_options(self):
-        if self.include_dirs is None:
-            self.include_dirs = self.distribution.include_dirs or []
-        elif isinstance(self.include_dirs, str):
-            self.include_dirs = self.include_dirs.split(os.pathsep)
-
-        if self.libraries is None:
-            self.libraries = []
-        elif isinstance(self.libraries, str):
-            self.libraries = [self.libraries]
-
-        if self.library_dirs is None:
-            self.library_dirs = []
-        elif isinstance(self.library_dirs, str):
-            self.library_dirs = self.library_dirs.split(os.pathsep)
-
-    def run(self):
-        pass
-
-    # Utility methods for actual "config" commands.  The interfaces are
-    # loosely based on Autoconf macros of similar names.  Sub-classes
-    # may use these freely.
-
-    def _check_compiler(self):
-        """Check that 'self.compiler' really is a CCompiler object;
-        if not, make it one.
-        """
-        # We do this late, and only on-demand, because this is an expensive
-        # import.
-        from distutils.ccompiler import CCompiler, new_compiler
-        if not isinstance(self.compiler, CCompiler):
-            self.compiler = new_compiler(compiler=self.compiler,
-                                         dry_run=self.dry_run, force=1)
-            customize_compiler(self.compiler)
-            if self.include_dirs:
-                self.compiler.set_include_dirs(self.include_dirs)
-            if self.libraries:
-                self.compiler.set_libraries(self.libraries)
-            if self.library_dirs:
-                self.compiler.set_library_dirs(self.library_dirs)
-
-    def _gen_temp_sourcefile(self, body, headers, lang):
-        filename = "_configtest" + LANG_EXT[lang]
-        with open(filename, "w") as file:
-            if headers:
-                for header in headers:
-                    file.write("#include <%s>\n" % header)
-                file.write("\n")
-            file.write(body)
-            if body[-1] != "\n":
-                file.write("\n")
-        return filename
-
-    def _preprocess(self, body, headers, include_dirs, lang):
-        src = self._gen_temp_sourcefile(body, headers, lang)
-        out = "_configtest.i"
-        self.temp_files.extend([src, out])
-        self.compiler.preprocess(src, out, include_dirs=include_dirs)
-        return (src, out)
-
-    def _compile(self, body, headers, include_dirs, lang):
-        src = self._gen_temp_sourcefile(body, headers, lang)
-        if self.dump_source:
-            dump_file(src, "compiling '%s':" % src)
-        (obj,) = self.compiler.object_filenames([src])
-        self.temp_files.extend([src, obj])
-        self.compiler.compile([src], include_dirs=include_dirs)
-        return (src, obj)
-
-    def _link(self, body, headers, include_dirs, libraries, library_dirs,
-              lang):
-        (src, obj) = self._compile(body, headers, include_dirs, lang)
-        prog = os.path.splitext(os.path.basename(src))[0]
-        self.compiler.link_executable([obj], prog,
-                                      libraries=libraries,
-                                      library_dirs=library_dirs,
-                                      target_lang=lang)
-
-        if self.compiler.exe_extension is not None:
-            prog = prog + self.compiler.exe_extension
-        self.temp_files.append(prog)
-
-        return (src, obj, prog)
-
-    def _clean(self, *filenames):
-        if not filenames:
-            filenames = self.temp_files
-            self.temp_files = []
-        log.info("removing: %s", ' '.join(filenames))
-        for filename in filenames:
-            try:
-                os.remove(filename)
-            except OSError:
-                pass
-
-
-    # XXX these ignore the dry-run flag: what to do, what to do? even if
-    # you want a dry-run build, you still need some sort of configuration
-    # info.  My inclination is to make it up to the real config command to
-    # consult 'dry_run', and assume a default (minimal) configuration if
-    # true.  The problem with trying to do it here is that you'd have to
-    # return either true or false from all the 'try' methods, neither of
-    # which is correct.
-
-    # XXX need access to the header search path and maybe default macros.
-
-    def try_cpp(self, body=None, headers=None, include_dirs=None, lang="c"):
-        """Construct a source file from 'body' (a string containing lines
-        of C/C++ code) and 'headers' (a list of header files to include)
-        and run it through the preprocessor.  Return true if the
-        preprocessor succeeded, false if there were any errors.
-        ('body' probably isn't of much use, but what the heck.)
-        """
-        from distutils.ccompiler import CompileError
-        self._check_compiler()
-        ok = True
-        try:
-            self._preprocess(body, headers, include_dirs, lang)
-        except CompileError:
-            ok = False
-
-        self._clean()
-        return ok
-
-    def search_cpp(self, pattern, body=None, headers=None, include_dirs=None,
-                   lang="c"):
-        """Construct a source file (just like 'try_cpp()'), run it through
-        the preprocessor, and return true if any line of the output matches
-        'pattern'.  'pattern' should either be a compiled regex object or a
-        string containing a regex.  If both 'body' and 'headers' are None,
-        preprocesses an empty file -- which can be useful to determine the
-        symbols the preprocessor and compiler set by default.
-        """
-        self._check_compiler()
-        src, out = self._preprocess(body, headers, include_dirs, lang)
-
-        if isinstance(pattern, str):
-            pattern = re.compile(pattern)
-
-        with open(out) as file:
-            match = False
-            while True:
-                line = file.readline()
-                if line == '':
-                    break
-                if pattern.search(line):
-                    match = True
-                    break
-
-        self._clean()
-        return match
-
-    def try_compile(self, body, headers=None, include_dirs=None, lang="c"):
-        """Try to compile a source file built from 'body' and 'headers'.
-        Return true on success, false otherwise.
-        """
-        from distutils.ccompiler import CompileError
-        self._check_compiler()
-        try:
-            self._compile(body, headers, include_dirs, lang)
-            ok = True
-        except CompileError:
-            ok = False
-
-        log.info(ok and "success!" or "failure.")
-        self._clean()
-        return ok
-
-    def try_link(self, body, headers=None, include_dirs=None, libraries=None,
-                 library_dirs=None, lang="c"):
-        """Try to compile and link a source file, built from 'body' and
-        'headers', to executable form.  Return true on success, false
-        otherwise.
-        """
-        from distutils.ccompiler import CompileError, LinkError
-        self._check_compiler()
-        try:
-            self._link(body, headers, include_dirs,
-                       libraries, library_dirs, lang)
-            ok = True
-        except (CompileError, LinkError):
-            ok = False
-
-        log.info(ok and "success!" or "failure.")
-        self._clean()
-        return ok
-
-    def try_run(self, body, headers=None, include_dirs=None, libraries=None,
-                library_dirs=None, lang="c"):
-        """Try to compile, link to an executable, and run a program
-        built from 'body' and 'headers'.  Return true on success, false
-        otherwise.
-        """
-        from distutils.ccompiler import CompileError, LinkError
-        self._check_compiler()
-        try:
-            src, obj, exe = self._link(body, headers, include_dirs,
-                                       libraries, library_dirs, lang)
-            self.spawn([exe])
-            ok = True
-        except (CompileError, LinkError, DistutilsExecError):
-            ok = False
-
-        log.info(ok and "success!" or "failure.")
-        self._clean()
-        return ok
-
-
-    # -- High-level methods --------------------------------------------
-    # (these are the ones that are actually likely to be useful
-    # when implementing a real-world config command!)
-
-    def check_func(self, func, headers=None, include_dirs=None,
-                   libraries=None, library_dirs=None, decl=0, call=0):
-        """Determine if function 'func' is available by constructing a
-        source file that refers to 'func', and compiles and links it.
-        If everything succeeds, returns true; otherwise returns false.
-
-        The constructed source file starts out by including the header
-        files listed in 'headers'.  If 'decl' is true, it then declares
-        'func' (as "int func()"); you probably shouldn't supply 'headers'
-        and set 'decl' true in the same call, or you might get errors about
-        a conflicting declarations for 'func'.  Finally, the constructed
-        'main()' function either references 'func' or (if 'call' is true)
-        calls it.  'libraries' and 'library_dirs' are used when
-        linking.
-        """
-        self._check_compiler()
-        body = []
-        if decl:
-            body.append("int %s ();" % func)
-        body.append("int main () {")
-        if call:
-            body.append("  %s();" % func)
-        else:
-            body.append("  %s;" % func)
-        body.append("}")
-        body = "\n".join(body) + "\n"
-
-        return self.try_link(body, headers, include_dirs,
-                             libraries, library_dirs)
-
-    def check_lib(self, library, library_dirs=None, headers=None,
-                  include_dirs=None, other_libraries=[]):
-        """Determine if 'library' is available to be linked against,
-        without actually checking that any particular symbols are provided
-        by it.  'headers' will be used in constructing the source file to
-        be compiled, but the only effect of this is to check if all the
-        header files listed are available.  Any libraries listed in
-        'other_libraries' will be included in the link, in case 'library'
-        has symbols that depend on other libraries.
-        """
-        self._check_compiler()
-        return self.try_link("int main (void) { }", headers, include_dirs,
-                             [library] + other_libraries, library_dirs)
-
-    def check_header(self, header, include_dirs=None, library_dirs=None,
-                     lang="c"):
-        """Determine if the system header file named by 'header_file'
-        exists and can be found by the preprocessor; return true if so,
-        false otherwise.
-        """
-        return self.try_cpp(body="/* No body */", headers=[header],
-                            include_dirs=include_dirs)
-
-def dump_file(filename, head=None):
-    """Dumps a file content into log.info.
-
-    If head is not None, will be dumped before the file content.
+class StaticModule:
     """
-    if head is None:
-        log.info('%s', filename)
-    else:
-        log.info(head)
-    file = open(filename)
+    Attempt to load the module by the name
+    """
+
+    def __init__(self, name):
+        spec = importlib.util.find_spec(name)
+        with open(spec.origin) as strm:
+            src = strm.read()
+        module = ast.parse(src)
+        vars(self).update(locals())
+        del self.self
+
+    def __getattr__(self, attr):
+        try:
+            return next(
+                ast.literal_eval(statement.value)
+                for statement in self.module.body
+                if isinstance(statement, ast.Assign)
+                for target in statement.targets
+                if isinstance(target, ast.Name) and target.id == attr
+            )
+        except Exception as e:
+            raise AttributeError(
+                "{self.name} has no attribute {attr}".format(**locals())
+            ) from e
+
+
+@contextlib.contextmanager
+def patch_path(path):
+    """
+    Add path to front of sys.path for the duration of the context.
+    """
     try:
-        log.info(file.read())
+        sys.path.insert(0, path)
+        yield
     finally:
-        file.close()
+        sys.path.remove(path)
+
+
+def read_configuration(filepath, find_others=False, ignore_option_errors=False):
+    """Read given configuration file and returns options from it as a dict.
+
+    :param str|unicode filepath: Path to configuration file
+        to get options from.
+
+    :param bool find_others: Whether to search for other configuration files
+        which could be on in various places.
+
+    :param bool ignore_option_errors: Whether to silently ignore
+        options, values of which could not be resolved (e.g. due to exceptions
+        in directives such as file:, attr:, etc.).
+        If False exceptions are propagated as expected.
+
+    :rtype: dict
+    """
+    from setuptools.dist import Distribution, _Distribution
+
+    filepath = os.path.abspath(filepath)
+
+    if not os.path.isfile(filepath):
+        raise DistutilsFileError('Configuration file %s does not exist.' % filepath)
+
+    current_directory = os.getcwd()
+    os.chdir(os.path.dirname(filepath))
+
+    try:
+        dist = Distribution()
+
+        filenames = dist.find_config_files() if find_others else []
+        if filepath not in filenames:
+            filenames.append(filepath)
+
+        _Distribution.parse_config_files(dist, filenames=filenames)
+
+        handlers = parse_configuration(
+            dist, dist.command_options, ignore_option_errors=ignore_option_errors
+        )
+
+    finally:
+        os.chdir(current_directory)
+
+    return configuration_to_dict(handlers)
+
+
+def _get_option(target_obj, key):
+    """
+    Given a target object and option key, get that option from
+    the target object, either through a get_{key} method or
+    from an attribute directly.
+    """
+    getter_name = 'get_{key}'.format(**locals())
+    by_attribute = functools.partial(getattr, target_obj, key)
+    getter = getattr(target_obj, getter_name, by_attribute)
+    return getter()
+
+
+def configuration_to_dict(handlers):
+    """Returns configuration data gathered by given handlers as a dict.
+
+    :param list[ConfigHandler] handlers: Handlers list,
+        usually from parse_configuration()
+
+    :rtype: dict
+    """
+    config_dict = defaultdict(dict)
+
+    for handler in handlers:
+        for option in handler.set_options:
+            value = _get_option(handler.target_obj, option)
+            config_dict[handler.section_prefix][option] = value
+
+    return config_dict
+
+
+def parse_configuration(distribution, command_options, ignore_option_errors=False):
+    """Performs additional parsing of configuration options
+    for a distribution.
+
+    Returns a list of used option handlers.
+
+    :param Distribution distribution:
+    :param dict command_options:
+    :param bool ignore_option_errors: Whether to silently ignore
+        options, values of which could not be resolved (e.g. due to exceptions
+        in directives such as file:, attr:, etc.).
+        If False exceptions are propagated as expected.
+    :rtype: list
+    """
+    options = ConfigOptionsHandler(distribution, command_options, ignore_option_errors)
+    options.parse()
+
+    meta = ConfigMetadataHandler(
+        distribution.metadata,
+        command_options,
+        ignore_option_errors,
+        distribution.package_dir,
+    )
+    meta.parse()
+
+    return meta, options
+
+
+class ConfigHandler:
+    """Handles metadata supplied in configuration files."""
+
+    section_prefix = None
+    """Prefix for config sections handled by this handler.
+    Must be provided by class heirs.
+
+    """
+
+    aliases = {}
+    """Options aliases.
+    For compatibility with various packages. E.g.: d2to1 and pbr.
+    Note: `-` in keys is replaced with `_` by config parser.
+
+    """
+
+    def __init__(self, target_obj, options, ignore_option_errors=False):
+        sections = {}
+
+        section_prefix = self.section_prefix
+        for section_name, section_options in options.items():
+            if not section_name.startswith(section_prefix):
+                continue
+
+            section_name = section_name.replace(section_prefix, '').strip('.')
+            sections[section_name] = section_options
+
+        self.ignore_option_errors = ignore_option_errors
+        self.target_obj = target_obj
+        self.sections = sections
+        self.set_options = []
+
+    @property
+    def parsers(self):
+        """Metadata item name to parser function mapping."""
+        raise NotImplementedError(
+            '%s must provide .parsers property' % self.__class__.__name__
+        )
+
+    def __setitem__(self, option_name, value):
+        unknown = tuple()
+        target_obj = self.target_obj
+
+        # Translate alias into real name.
+        option_name = self.aliases.get(option_name, option_name)
+
+        current_value = getattr(target_obj, option_name, unknown)
+
+        if current_value is unknown:
+            raise KeyError(option_name)
+
+        if current_value:
+            # Already inhabited. Skipping.
+            return
+
+        skip_option = False
+        parser = self.parsers.get(option_name)
+        if parser:
+            try:
+                value = parser(value)
+
+            except Exception:
+                skip_option = True
+                if not self.ignore_option_errors:
+                    raise
+
+        if skip_option:
+            return
+
+        setter = getattr(target_obj, 'set_%s' % option_name, None)
+        if setter is None:
+            setattr(target_obj, option_name, value)
+        else:
+            setter(value)
+
+        self.set_options.append(option_name)
+
+    @classmethod
+    def _parse_list(cls, value, separator=','):
+        """Represents value as a list.
+
+        Value is split either by separator (defaults to comma) or by lines.
+
+        :param value:
+        :param separator: List items separator character.
+        :rtype: list
+        """
+        if isinstance(value, list):  # _get_parser_compound case
+            return value
+
+        if '\n' in value:
+            value = value.splitlines()
+        else:
+            value = value.split(separator)
+
+        return [chunk.strip() for chunk in value if chunk.strip()]
+
+    @classmethod
+    def _parse_list_glob(cls, value, separator=','):
+        """Equivalent to _parse_list() but expands any glob patterns using glob().
+
+        However, unlike with glob() calls, the results remain relative paths.
+
+        :param value:
+        :param separator: List items separator character.
+        :rtype: list
+        """
+        glob_characters = ('*', '?', '[', ']', '{', '}')
+        values = cls._parse_list(value, separator=separator)
+        expanded_values = []
+        for value in values:
+
+            # Has globby characters?
+            if any(char in value for char in glob_characters):
+                # then expand the glob pattern while keeping paths *relative*:
+                expanded_values.extend(sorted(
+                    os.path.relpath(path, os.getcwd())
+                    for path in iglob(os.path.abspath(value))))
+
+            else:
+                # take the value as-is:
+                expanded_values.append(value)
+
+        return expanded_values
+
+    @classmethod
+    def _parse_dict(cls, value):
+        """Represents value as a dict.
+
+        :param value:
+        :rtype: dict
+        """
+        separator = '='
+        result = {}
+        for line in cls._parse_list(value):
+            key, sep, val = line.partition(separator)
+            if sep != separator:
+                raise DistutilsOptionError(
+                    'Unable to parse option value to dict: %s' % value
+                )
+            result[key.strip()] = val.strip()
+
+        return result
+
+    @classmethod
+    def _parse_bool(cls, value):
+        """Represents value as boolean.
+
+        :param value:
+        :rtype: bool
+        """
+        value = value.lower()
+        return value in ('1', 'true', 'yes')
+
+    @classmethod
+    def _exclude_files_parser(cls, key):
+        """Returns a parser function to make sure field inputs
+        are not files.
+
+        Parses a value after getting the key so error messages are
+        more informative.
+
+        :param key:
+        :rtype: callable
+        """
+
+        def parser(value):
+            exclude_directive = 'file:'
+            if value.startswith(exclude_directive):
+                raise ValueError(
+                    'Only strings are accepted for the {0} field, '
+                    'files are not accepted'.format(key)
+                )
+            return value
+
+        return parser
+
+    @classmethod
+    def _parse_file(cls, value):
+        """Represents value as a string, allowing including text
+        from nearest files using `file:` directive.
+
+        Directive is sandboxed and won't reach anything outside
+        directory with setup.py.
+
+        Examples:
+            file: README.rst, CHANGELOG.md, src/file.txt
+
+        :param str value:
+        :rtype: str
+        """
+        include_directive = 'file:'
+
+        if not isinstance(value, str):
+            return value
+
+        if not value.startswith(include_directive):
+            return value
+
+        spec = value[len(include_directive) :]
+        filepaths = (os.path.abspath(path.strip()) for path in spec.split(','))
+        return '\n'.join(
+            cls._read_file(path)
+            for path in filepaths
+            if (cls._assert_local(path) or True) and os.path.isfile(path)
+        )
+
+    @staticmethod
+    def _assert_local(filepath):
+        if not filepath.startswith(os.getcwd()):
+            raise DistutilsOptionError('`file:` directive can not access %s' % filepath)
+
+    @staticmethod
+    def _read_file(filepath):
+        with io.open(filepath, encoding='utf-8') as f:
+            return f.read()
+
+    @classmethod
+    def _parse_attr(cls, value, package_dir=None):
+        """Represents value as a module attribute.
+
+        Examples:
+            attr: package.attr
+            attr: package.module.attr
+
+        :param str value:
+        :rtype: str
+        """
+        attr_directive = 'attr:'
+        if not value.startswith(attr_directive):
+            return value
+
+        attrs_path = value.replace(attr_directive, '').strip().split('.')
+        attr_name = attrs_path.pop()
+
+        module_name = '.'.join(attrs_path)
+        module_name = module_name or '__init__'
+
+        parent_path = os.getcwd()
+        if package_dir:
+            if attrs_path[0] in package_dir:
+                # A custom path was specified for the module we want to import
+                custom_path = package_dir[attrs_path[0]]
+                parts = custom_path.rsplit('/', 1)
+                if len(parts) > 1:
+                    parent_path = os.path.join(os.getcwd(), parts[0])
+                    module_name = parts[1]
+                else:
+                    module_name = custom_path
+            elif '' in package_dir:
+                # A custom parent directory was specified for all root modules
+                parent_path = os.path.join(os.getcwd(), package_dir[''])
+
+        with patch_path(parent_path):
+            try:
+                # attempt to load value statically
+                return getattr(StaticModule(module_name), attr_name)
+            except Exception:
+                # fallback to simple import
+                module = importlib.import_module(module_name)
+
+        return getattr(module, attr_name)
+
+    @classmethod
+    def _get_parser_compound(cls, *parse_methods):
+        """Returns parser function to represents value as a list.
+
+        Parses a value applying given methods one after another.
+
+        :param parse_methods:
+        :rtype: callable
+        """
+
+        def parse(value):
+            parsed = value
+
+            for method in parse_methods:
+                parsed = method(parsed)
+
+            return parsed
+
+        return parse
+
+    @classmethod
+    def _parse_section_to_dict(cls, section_options, values_parser=None):
+        """Parses section options into a dictionary.
+
+        Optionally applies a given parser to values.
+
+        :param dict section_options:
+        :param callable values_parser:
+        :rtype: dict
+        """
+        value = {}
+        values_parser = values_parser or (lambda val: val)
+        for key, (_, val) in section_options.items():
+            value[key] = values_parser(val)
+        return value
+
+    def parse_section(self, section_options):
+        """Parses configuration file section.
+
+        :param dict section_options:
+        """
+        for (name, (_, value)) in section_options.items():
+            try:
+                self[name] = value
+
+            except KeyError:
+                pass  # Keep silent for a new option may appear anytime.
+
+    def parse(self):
+        """Parses configuration file items from one
+        or more related sections.
+
+        """
+        for section_name, section_options in self.sections.items():
+
+            method_postfix = ''
+            if section_name:  # [section.option] variant
+                method_postfix = '_%s' % section_name
+
+            section_parser_method = getattr(
+                self,
+                # Dots in section names are translated into dunderscores.
+                ('parse_section%s' % method_postfix).replace('.', '__'),
+                None,
+            )
+
+            if section_parser_method is None:
+                raise DistutilsOptionError(
+                    'Unsupported distribution option section: [%s.%s]'
+                    % (self.section_prefix, section_name)
+                )
+
+            section_parser_method(section_options)
+
+    def _deprecated_config_handler(self, func, msg, warning_class):
+        """this function will wrap around parameters that are deprecated
+
+        :param msg: deprecation message
+        :param warning_class: class of warning exception to be raised
+        :param func: function to be wrapped around
+        """
+
+        @wraps(func)
+        def config_handler(*args, **kwargs):
+            warnings.warn(msg, warning_class)
+            return func(*args, **kwargs)
+
+        return config_handler
+
+
+class ConfigMetadataHandler(ConfigHandler):
+
+    section_prefix = 'metadata'
+
+    aliases = {
+        'home_page': 'url',
+        'summary': 'description',
+        'classifier': 'classifiers',
+        'platform': 'platforms',
+    }
+
+    strict_mode = False
+    """We need to keep it loose, to be partially compatible with
+    `pbr` and `d2to1` packages which also uses `metadata` section.
+
+    """
+
+    def __init__(
+        self, target_obj, options, ignore_option_errors=False, package_dir=None
+    ):
+        super(ConfigMetadataHandler, self).__init__(
+            target_obj, options, ignore_option_errors
+        )
+        self.package_dir = package_dir
+
+    @property
+    def parsers(self):
+        """Metadata item name to parser function mapping."""
+        parse_list = self._parse_list
+        parse_file = self._parse_file
+        parse_dict = self._parse_dict
+        exclude_files_parser = self._exclude_files_parser
+
+        return {
+            'platforms': parse_list,
+            'keywords': parse_list,
+            'provides': parse_list,
+            'requires': self._deprecated_config_handler(
+                parse_list,
+                "The requires parameter is deprecated, please use "
+                "install_requires for runtime dependencies.",
+                DeprecationWarning,
+            ),
+            'obsoletes': parse_list,
+            'classifiers': self._get_parser_compound(parse_file, parse_list),
+            'license': exclude_files_parser('license'),
+            'license_file': self._deprecated_config_handler(
+                exclude_files_parser('license_file'),
+                "The license_file parameter is deprecated, "
+                "use license_files instead.",
+                DeprecationWarning,
+            ),
+            'license_files': parse_list,
+            'description': parse_file,
+            'long_description': parse_file,
+            'version': self._parse_version,
+            'project_urls': parse_dict,
+        }
+
+    def _parse_version(self, value):
+        """Parses `version` option value.
+
+        :param value:
+        :rtype: str
+
+        """
+        version = self._parse_file(value)
+
+        if version != value:
+            version = version.strip()
+            # Be strict about versions loaded from file because it's easy to
+            # accidentally include newlines and other unintended content
+            if isinstance(parse(version), LegacyVersion):
+                tmpl = (
+                    'Version loaded from {value} does not '
+                    'comply with PEP 440: {version}'
+                )
+                raise DistutilsOptionError(tmpl.format(**locals()))
+
+            return version
+
+        version = self._parse_attr(value, self.package_dir)
+
+        if callable(version):
+            version = version()
+
+        if not isinstance(version, str):
+            if hasattr(version, '__iter__'):
+                version = '.'.join(map(str, version))
+            else:
+                version = '%s' % version
+
+        return version
+
+
+class ConfigOptionsHandler(ConfigHandler):
+
+    section_prefix = 'options'
+
+    @property
+    def parsers(self):
+        """Metadata item name to parser function mapping."""
+        parse_list = self._parse_list
+        parse_list_semicolon = partial(self._parse_list, separator=';')
+        parse_bool = self._parse_bool
+        parse_dict = self._parse_dict
+        parse_cmdclass = self._parse_cmdclass
+
+        return {
+            'zip_safe': parse_bool,
+            'include_package_data': parse_bool,
+            'package_dir': parse_dict,
+            'scripts': parse_list,
+            'eager_resources': parse_list,
+            'dependency_links': parse_list,
+            'namespace_packages': parse_list,
+            'install_requires': parse_list_semicolon,
+            'setup_requires': parse_list_semicolon,
+            'tests_require': parse_list_semicolon,
+            'packages': self._parse_packages,
+            'entry_points': self._parse_file,
+            'py_modules': parse_list,
+            'python_requires': SpecifierSet,
+            'cmdclass': parse_cmdclass,
+        }
+
+    def _parse_cmdclass(self, value):
+        def resolve_class(qualified_class_name):
+            idx = qualified_class_name.rfind('.')
+            class_name = qualified_class_name[idx + 1 :]
+            pkg_name = qualified_class_name[:idx]
+
+            module = __import__(pkg_name)
+
+            return getattr(module, class_name)
+
+        return {k: resolve_class(v) for k, v in self._parse_dict(value).items()}
+
+    def _parse_packages(self, value):
+        """Parses `packages` option value.
+
+        :param value:
+        :rtype: list
+        """
+        find_directives = ['find:', 'find_namespace:']
+        trimmed_value = value.strip()
+
+        if trimmed_value not in find_directives:
+            return self._parse_list(value)
+
+        findns = trimmed_value == find_directives[1]
+
+        # Read function arguments from a dedicated section.
+        find_kwargs = self.parse_section_packages__find(
+            self.sections.get('packages.find', {})
+        )
+
+        if findns:
+            from setuptools import find_namespace_packages as find_packages
+        else:
+            from setuptools import find_packages
+
+        return find_packages(**find_kwargs)
+
+    def parse_section_packages__find(self, section_options):
+        """Parses `packages.find` configuration file section.
+
+        To be used in conjunction with _parse_packages().
+
+        :param dict section_options:
+        """
+        section_data = self._parse_section_to_dict(section_options, self._parse_list)
+
+        valid_keys = ['where', 'include', 'exclude']
+
+        find_kwargs = dict(
+            [(k, v) for k, v in section_data.items() if k in valid_keys and v]
+        )
+
+        where = find_kwargs.get('where')
+        if where is not None:
+            find_kwargs['where'] = where[0]  # cast list to single val
+
+        return find_kwargs
+
+    def parse_section_entry_points(self, section_options):
+        """Parses `entry_points` configuration file section.
+
+        :param dict section_options:
+        """
+        parsed = self._parse_section_to_dict(section_options, self._parse_list)
+        self['entry_points'] = parsed
+
+    def _parse_package_data(self, section_options):
+        parsed = self._parse_section_to_dict(section_options, self._parse_list)
+
+        root = parsed.get('*')
+        if root:
+            parsed[''] = root
+            del parsed['*']
+
+        return parsed
+
+    def parse_section_package_data(self, section_options):
+        """Parses `package_data` configuration file section.
+
+        :param dict section_options:
+        """
+        self['package_data'] = self._parse_package_data(section_options)
+
+    def parse_section_exclude_package_data(self, section_options):
+        """Parses `exclude_package_data` configuration file section.
+
+        :param dict section_options:
+        """
+        self['exclude_package_data'] = self._parse_package_data(section_options)
+
+    def parse_section_extras_require(self, section_options):
+        """Parses `extras_require` configuration file section.
+
+        :param dict section_options:
+        """
+        parse_list = partial(self._parse_list, separator=';')
+        self['extras_require'] = self._parse_section_to_dict(
+            section_options, parse_list
+        )
+
+    def parse_section_data_files(self, section_options):
+        """Parses `data_files` configuration file section.
+
+        :param dict section_options:
+        """
+        parsed = self._parse_section_to_dict(section_options, self._parse_list_glob)
+        self['data_files'] = [(k, v) for k, v in parsed.items()]
