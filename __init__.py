@@ -1,242 +1,128 @@
-"""Extensions to the 'distutils' for large or complex distributions"""
-
-from fnmatch import fnmatchcase
-import functools
+import sys
 import os
 import re
-
-import _distutils_hack.override  # noqa: F401
-
-import distutils.core
-from distutils.errors import DistutilsOptionError
-from distutils.util import convert_path
-
-from ._deprecation_warning import SetuptoolsDeprecationWarning
-
-import setuptools.version
-from setuptools.extension import Extension
-from setuptools.dist import Distribution
-from setuptools.depends import Require
-from . import monkey
+import importlib
+import warnings
 
 
-__all__ = [
-    'setup',
-    'Distribution',
-    'Command',
-    'Extension',
-    'Require',
-    'SetuptoolsDeprecationWarning',
-    'find_packages',
-    'find_namespace_packages',
-]
-
-__version__ = setuptools.version.__version__
-
-bootstrap_install_from = None
+is_pypy = '__pypy__' in sys.builtin_module_names
 
 
-class PackageFinder:
+warnings.filterwarnings('ignore',
+                        r'.+ distutils\b.+ deprecated',
+                        DeprecationWarning)
+
+
+def warn_distutils_present():
+    if 'distutils' not in sys.modules:
+        return
+    if is_pypy and sys.version_info < (3, 7):
+        # PyPy for 3.6 unconditionally imports distutils, so bypass the warning
+        # https://foss.heptapod.net/pypy/pypy/-/blob/be829135bc0d758997b3566062999ee8b23872b4/lib-python/3/site.py#L250
+        return
+    warnings.warn(
+        "Distutils was imported before Setuptools, but importing Setuptools "
+        "also replaces the `distutils` module in `sys.modules`. This may lead "
+        "to undesirable behaviors or errors. To avoid these issues, avoid "
+        "using distutils directly, ensure that setuptools is installed in the "
+        "traditional way (e.g. not an editable install), and/or make sure "
+        "that setuptools is always imported before distutils.")
+
+
+def clear_distutils():
+    if 'distutils' not in sys.modules:
+        return
+    warnings.warn("Setuptools is replacing distutils.")
+    mods = [name for name in sys.modules if re.match(r'distutils\b', name)]
+    for name in mods:
+        del sys.modules[name]
+
+
+def enabled():
     """
-    Generate a list of all Python packages found within a directory
+    Allow selection of distutils by environment variable.
     """
+    which = os.environ.get('SETUPTOOLS_USE_DISTUTILS', 'stdlib')
+    return which == 'local'
 
-    @classmethod
-    def find(cls, where='.', exclude=(), include=('*',)):
-        """Return a list all Python packages found within directory 'where'
 
-        'where' is the root directory which will be searched for packages.  It
-        should be supplied as a "cross-platform" (i.e. URL-style) path; it will
-        be converted to the appropriate local path syntax.
+def ensure_local_distutils():
+    clear_distutils()
+    distutils = importlib.import_module('setuptools._distutils')
+    distutils.__name__ = 'distutils'
+    sys.modules['distutils'] = distutils
 
-        'exclude' is a sequence of package names to exclude; '*' can be used
-        as a wildcard in the names, such that 'foo.*' will exclude all
-        subpackages of 'foo' (but not 'foo' itself).
+    # sanity check that submodules load as expected
+    core = importlib.import_module('distutils.core')
+    assert '_distutils' in core.__file__, core.__file__
 
-        'include' is a sequence of package names to include.  If it's
-        specified, only the named packages will be included.  If it's not
-        specified, all found packages will be included.  'include' can contain
-        shell style wildcard patterns just like 'exclude'.
+
+def do_override():
+    """
+    Ensure that the local copy of distutils is preferred over stdlib.
+
+    See https://github.com/pypa/setuptools/issues/417#issuecomment-392298401
+    for more motivation.
+    """
+    if enabled():
+        warn_distutils_present()
+        ensure_local_distutils()
+
+
+class DistutilsMetaFinder:
+    def find_spec(self, fullname, path, target=None):
+        if path is not None:
+            return
+
+        method_name = 'spec_for_{fullname}'.format(**locals())
+        method = getattr(self, method_name, lambda: None)
+        return method()
+
+    def spec_for_distutils(self):
+        import importlib.abc
+        import importlib.util
+
+        class DistutilsLoader(importlib.abc.Loader):
+
+            def create_module(self, spec):
+                return importlib.import_module('setuptools._distutils')
+
+            def exec_module(self, module):
+                pass
+
+        return importlib.util.spec_from_loader('distutils', DistutilsLoader())
+
+    def spec_for_pip(self):
         """
+        Ensure stdlib distutils when running under pip.
+        See pypa/pip#8761 for rationale.
+        """
+        if self.pip_imported_during_build():
+            return
+        clear_distutils()
+        self.spec_for_distutils = lambda: None
 
-        return list(
-            cls._find_packages_iter(
-                convert_path(where),
-                cls._build_filter('ez_setup', '*__pycache__', *exclude),
-                cls._build_filter(*include),
-            )
+    @staticmethod
+    def pip_imported_during_build():
+        """
+        Detect if pip is being imported in a build script. Ref #2355.
+        """
+        import traceback
+        return any(
+            frame.f_globals['__file__'].endswith('setup.py')
+            for frame, line in traceback.walk_stack(None)
         )
 
-    @classmethod
-    def _find_packages_iter(cls, where, exclude, include):
-        """
-        All the packages found in 'where' that pass the 'include' filter, but
-        not the 'exclude' filter.
-        """
-        for root, dirs, files in os.walk(where, followlinks=True):
-            # Copy dirs to iterate over it, then empty dirs.
-            all_dirs = dirs[:]
-            dirs[:] = []
 
-            for dir in all_dirs:
-                full_path = os.path.join(root, dir)
-                rel_path = os.path.relpath(full_path, where)
-                package = rel_path.replace(os.path.sep, '.')
-
-                # Skip directory trees that are not valid packages
-                if '.' in dir or not cls._looks_like_package(full_path):
-                    continue
-
-                # Should this package be included?
-                if include(package) and not exclude(package):
-                    yield package
-
-                # Keep searching subdirectories, as there may be more packages
-                # down there, even if the parent was excluded.
-                dirs.append(dir)
-
-    @staticmethod
-    def _looks_like_package(path):
-        """Does a directory look like a package?"""
-        return os.path.isfile(os.path.join(path, '__init__.py'))
-
-    @staticmethod
-    def _build_filter(*patterns):
-        """
-        Given a list of patterns, return a callable that will be true only if
-        the input matches at least one of the patterns.
-        """
-        return lambda name: any(fnmatchcase(name, pat=pat) for pat in patterns)
+DISTUTILS_FINDER = DistutilsMetaFinder()
 
 
-class PEP420PackageFinder(PackageFinder):
-    @staticmethod
-    def _looks_like_package(path):
-        return True
+def add_shim():
+    sys.meta_path.insert(0, DISTUTILS_FINDER)
 
 
-find_packages = PackageFinder.find
-find_namespace_packages = PEP420PackageFinder.find
-
-
-def _install_setup_requires(attrs):
-    # Note: do not use `setuptools.Distribution` directly, as
-    # our PEP 517 backend patch `distutils.core.Distribution`.
-    class MinimalDistribution(distutils.core.Distribution):
-        """
-        A minimal version of a distribution for supporting the
-        fetch_build_eggs interface.
-        """
-
-        def __init__(self, attrs):
-            _incl = 'dependency_links', 'setup_requires'
-            filtered = {k: attrs[k] for k in set(_incl) & set(attrs)}
-            distutils.core.Distribution.__init__(self, filtered)
-
-        def finalize_options(self):
-            """
-            Disable finalize_options to avoid building the working set.
-            Ref #2158.
-            """
-
-    dist = MinimalDistribution(attrs)
-
-    # Honor setup.cfg's options.
-    dist.parse_config_files(ignore_option_errors=True)
-    if dist.setup_requires:
-        dist.fetch_build_eggs(dist.setup_requires)
-
-
-def setup(**attrs):
-    # Make sure we have any requirements needed to interpret 'attrs'.
-    _install_setup_requires(attrs)
-    return distutils.core.setup(**attrs)
-
-
-setup.__doc__ = distutils.core.setup.__doc__
-
-
-_Command = monkey.get_unpatched(distutils.core.Command)
-
-
-class Command(_Command):
-    __doc__ = _Command.__doc__
-
-    command_consumes_arguments = False
-
-    def __init__(self, dist, **kw):
-        """
-        Construct the command for dist, updating
-        vars(self) with any keyword parameters.
-        """
-        _Command.__init__(self, dist)
-        vars(self).update(kw)
-
-    def _ensure_stringlike(self, option, what, default=None):
-        val = getattr(self, option)
-        if val is None:
-            setattr(self, option, default)
-            return default
-        elif not isinstance(val, str):
-            raise DistutilsOptionError(
-                "'%s' must be a %s (got `%s`)" % (option, what, val)
-            )
-        return val
-
-    def ensure_string_list(self, option):
-        r"""Ensure that 'option' is a list of strings.  If 'option' is
-        currently a string, we split it either on /,\s*/ or /\s+/, so
-        "foo bar baz", "foo,bar,baz", and "foo,   bar baz" all become
-        ["foo", "bar", "baz"].
-        """
-        val = getattr(self, option)
-        if val is None:
-            return
-        elif isinstance(val, str):
-            setattr(self, option, re.split(r',\s*|\s+', val))
-        else:
-            if isinstance(val, list):
-                ok = all(isinstance(v, str) for v in val)
-            else:
-                ok = False
-            if not ok:
-                raise DistutilsOptionError(
-                    "'%s' must be a list of strings (got %r)" % (option, val)
-                )
-
-    def reinitialize_command(self, command, reinit_subcommands=0, **kw):
-        cmd = _Command.reinitialize_command(self, command, reinit_subcommands)
-        vars(cmd).update(kw)
-        return cmd
-
-
-def _find_all_simple(path):
-    """
-    Find all files under 'path'
-    """
-    results = (
-        os.path.join(base, file)
-        for base, dirs, files in os.walk(path, followlinks=True)
-        for file in files
-    )
-    return filter(os.path.isfile, results)
-
-
-def findall(dir=os.curdir):
-    """
-    Find all files under 'dir' and return the list of full filenames.
-    Unless dir is '.', return full filenames with dir prepended.
-    """
-    files = _find_all_simple(dir)
-    if dir == os.curdir:
-        make_rel = functools.partial(os.path.relpath, start=dir)
-        files = map(make_rel, files)
-    return list(files)
-
-
-class sic(str):
-    """Treat this string as-is (https://en.wikipedia.org/wiki/Sic)"""
-
-
-# Apply monkey patches
-monkey.patch_all()
+def remove_shim():
+    try:
+        sys.meta_path.remove(DISTUTILS_FINDER)
+    except ValueError:
+        pass
