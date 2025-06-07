@@ -1,128 +1,93 @@
-import sys
-import os
-import re
-import importlib
-import warnings
+"""
+future: Easy, safe support for Python 2/3 compatibility
+=======================================================
+
+``future`` is the missing compatibility layer between Python 2 and Python
+3. It allows you to use a single, clean Python 3.x-compatible codebase to
+support both Python 2 and Python 3 with minimal overhead.
+
+It is designed to be used as follows::
+
+    from __future__ import (absolute_import, division,
+                            print_function, unicode_literals)
+    from builtins import (
+             bytes, dict, int, list, object, range, str,
+             ascii, chr, hex, input, next, oct, open,
+             pow, round, super,
+             filter, map, zip)
+
+followed by predominantly standard, idiomatic Python 3 code that then runs
+similarly on Python 2.6/2.7 and Python 3.3+.
+
+The imports have no effect on Python 3. On Python 2, they shadow the
+corresponding builtins, which normally have different semantics on Python 3
+versus 2, to provide their Python 3 semantics.
 
 
-is_pypy = '__pypy__' in sys.builtin_module_names
+Standard library reorganization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``future`` supports the standard library reorganization (PEP 3108) through the
+following Py3 interfaces:
+
+    >>> # Top-level packages with Py3 names provided on Py2:
+    >>> import html.parser
+    >>> import queue
+    >>> import tkinter.dialog
+    >>> import xmlrpc.client
+    >>> # etc.
+
+    >>> # Aliases provided for extensions to existing Py2 module names:
+    >>> from future.standard_library import install_aliases
+    >>> install_aliases()
+
+    >>> from collections import Counter, OrderedDict   # backported to Py2.6
+    >>> from collections import UserDict, UserList, UserString
+    >>> import urllib.request
+    >>> from itertools import filterfalse, zip_longest
+    >>> from subprocess import getoutput, getstatusoutput
 
 
-warnings.filterwarnings('ignore',
-                        r'.+ distutils\b.+ deprecated',
-                        DeprecationWarning)
+Automatic conversion
+--------------------
+
+An included script called `futurize
+<http://python-future.org/automatic_conversion.html>`_ aids in converting
+code (from either Python 2 or Python 3) to code compatible with both
+platforms. It is similar to ``python-modernize`` but goes further in
+providing Python 3 compatibility through the use of the backported types
+and builtin functions in ``future``.
 
 
-def warn_distutils_present():
-    if 'distutils' not in sys.modules:
-        return
-    if is_pypy and sys.version_info < (3, 7):
-        # PyPy for 3.6 unconditionally imports distutils, so bypass the warning
-        # https://foss.heptapod.net/pypy/pypy/-/blob/be829135bc0d758997b3566062999ee8b23872b4/lib-python/3/site.py#L250
-        return
-    warnings.warn(
-        "Distutils was imported before Setuptools, but importing Setuptools "
-        "also replaces the `distutils` module in `sys.modules`. This may lead "
-        "to undesirable behaviors or errors. To avoid these issues, avoid "
-        "using distutils directly, ensure that setuptools is installed in the "
-        "traditional way (e.g. not an editable install), and/or make sure "
-        "that setuptools is always imported before distutils.")
+Documentation
+-------------
+
+See: http://python-future.org
 
 
-def clear_distutils():
-    if 'distutils' not in sys.modules:
-        return
-    warnings.warn("Setuptools is replacing distutils.")
-    mods = [name for name in sys.modules if re.match(r'distutils\b', name)]
-    for name in mods:
-        del sys.modules[name]
+Credits
+-------
+
+:Author:  Ed Schofield, Jordan M. Adler, et al
+:Sponsor: Python Charmers Pty Ltd, Australia, and Python Charmers Pte
+          Ltd, Singapore. http://pythoncharmers.com
+:Others:  See docs/credits.rst or http://python-future.org/credits.html
 
 
-def enabled():
-    """
-    Allow selection of distutils by environment variable.
-    """
-    which = os.environ.get('SETUPTOOLS_USE_DISTUTILS', 'stdlib')
-    return which == 'local'
+Licensing
+---------
+Copyright 2013-2019 Python Charmers Pty Ltd, Australia.
+The software is distributed under an MIT licence. See LICENSE.txt.
 
+"""
 
-def ensure_local_distutils():
-    clear_distutils()
-    distutils = importlib.import_module('setuptools._distutils')
-    distutils.__name__ = 'distutils'
-    sys.modules['distutils'] = distutils
-
-    # sanity check that submodules load as expected
-    core = importlib.import_module('distutils.core')
-    assert '_distutils' in core.__file__, core.__file__
-
-
-def do_override():
-    """
-    Ensure that the local copy of distutils is preferred over stdlib.
-
-    See https://github.com/pypa/setuptools/issues/417#issuecomment-392298401
-    for more motivation.
-    """
-    if enabled():
-        warn_distutils_present()
-        ensure_local_distutils()
-
-
-class DistutilsMetaFinder:
-    def find_spec(self, fullname, path, target=None):
-        if path is not None:
-            return
-
-        method_name = 'spec_for_{fullname}'.format(**locals())
-        method = getattr(self, method_name, lambda: None)
-        return method()
-
-    def spec_for_distutils(self):
-        import importlib.abc
-        import importlib.util
-
-        class DistutilsLoader(importlib.abc.Loader):
-
-            def create_module(self, spec):
-                return importlib.import_module('setuptools._distutils')
-
-            def exec_module(self, module):
-                pass
-
-        return importlib.util.spec_from_loader('distutils', DistutilsLoader())
-
-    def spec_for_pip(self):
-        """
-        Ensure stdlib distutils when running under pip.
-        See pypa/pip#8761 for rationale.
-        """
-        if self.pip_imported_during_build():
-            return
-        clear_distutils()
-        self.spec_for_distutils = lambda: None
-
-    @staticmethod
-    def pip_imported_during_build():
-        """
-        Detect if pip is being imported in a build script. Ref #2355.
-        """
-        import traceback
-        return any(
-            frame.f_globals['__file__'].endswith('setup.py')
-            for frame, line in traceback.walk_stack(None)
-        )
-
-
-DISTUTILS_FINDER = DistutilsMetaFinder()
-
-
-def add_shim():
-    sys.meta_path.insert(0, DISTUTILS_FINDER)
-
-
-def remove_shim():
-    try:
-        sys.meta_path.remove(DISTUTILS_FINDER)
-    except ValueError:
-        pass
+__title__ = 'future'
+__author__ = 'Ed Schofield'
+__license__ = 'MIT'
+__copyright__ = 'Copyright 2013-2019 Python Charmers Pty Ltd'
+__ver_major__ = 0
+__ver_minor__ = 18
+__ver_patch__ = 2
+__ver_sub__ = ''
+__version__ = "%d.%d.%d%s" % (__ver_major__, __ver_minor__,
+                              __ver_patch__, __ver_sub__)
