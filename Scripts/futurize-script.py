@@ -1,4 +1,4 @@
-#!"d:\proyectos\the url god\the-url-god\scripts\python.exe"
+#!"d:\proyectos\the url god\the-url-god-2\scripts\python.exe"
 # EASY-INSTALL-ENTRY-SCRIPT: 'future==0.18.2','console_scripts','futurize'
 import re
 import sys

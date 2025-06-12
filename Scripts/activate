@@ -37,7 +37,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV="D:\Proyectos\The URL GOD\the-url-god"
+VIRTUAL_ENV="D:\Proyectos\The URL GOD\the-url-god-2"
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"
@@ -54,7 +54,7 @@ fi
 
 if [ -z "${VIRTUAL_ENV_DISABLE_PROMPT:-}" ] ; then
     _OLD_VIRTUAL_PS1="${PS1:-}"
-    PS1="(the-url-god) ${PS1:-}"
+    PS1="(the-url-god-2) ${PS1:-}"
     export PS1
 fi
 
